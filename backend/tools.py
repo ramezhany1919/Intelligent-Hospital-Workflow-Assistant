@@ -1,11 +1,30 @@
 import smtplib
 import os
+import json
 from email.mime.text import MIMEText
-from typing import Optional
 from langchain_core.tools import tool
 from backend.database import get_session
 from backend.models import User, Doctor, DoctorSlot, Appointment, MedicalReport
 
+
+def _parse_str(raw, key):
+    """Extract a single value when the ReAct agent passes a JSON string as a single-param tool arg."""
+    if isinstance(raw, str) and raw.strip().startswith("{"):
+        try:
+            return json.loads(raw)[key]
+        except Exception:
+            pass
+    return raw
+
+
+def _parse_json(raw):
+    """Parse a JSON string or passthrough a dict — used for multi-param tools."""
+    if isinstance(raw, str):
+        return json.loads(raw)
+    return raw
+
+
+# ── Single-param tools (no Pydantic conflict) ─────────────────────────────────
 
 @tool
 def get_patient_history(email: str) -> dict:
@@ -13,7 +32,9 @@ def get_patient_history(email: str) -> dict:
     Retrieve the patient's profile and past appointment history from the database.
     Call this at the start of every intake session before asking any follow-up questions.
     Returns age, chronic disease history, and a list of previous visits.
+    Input: email (string)
     """
+    email = _parse_str(email, "email")
     db = get_session()
     try:
         user = db.query(User).filter(User.email == email).first()
@@ -55,7 +76,9 @@ def find_available_doctor(specialty: str) -> dict:
     Specialty must be one of: cardiology, neurology, general, orthopedics, dermatology,
     gastroenterology, pulmonology, endocrinology.
     Use 'general' if no specific specialty is required.
+    Input: specialty (string)
     """
+    specialty = _parse_str(specialty, "specialty")
     db = get_session()
     try:
         doctor = (
@@ -92,17 +115,31 @@ def find_available_doctor(specialty: str) -> dict:
         db.close()
 
 
+# ── Multi-param tools: accept a single JSON string to avoid Pydantic conflict ──
+
 @tool
-def book_appointment(user_email: str, doctor_id: int, slot_id: int, priority: int) -> dict:
+def book_appointment(input_json: str) -> dict:
     """
     Book an appointment by linking the patient to a doctor's time slot.
+    Input must be a JSON string with keys:
+      user_email (str), doctor_id (int), slot_id (int), priority (int).
     Priority: 0=urgent (chest pain, stroke), 1=high, 2=moderate, 3=routine.
     This atomically marks the slot as booked so no two patients can claim the same slot.
+    Example: {"user_email": "alice@example.com", "doctor_id": 1, "slot_id": 3, "priority": 1}
     """
+    try:
+        params = _parse_json(input_json)
+        user_email = params["user_email"]
+        doctor_id  = int(params["doctor_id"])
+        slot_id    = int(params["slot_id"])
+        priority   = int(params["priority"])
+    except Exception as e:
+        return {"success": False, "error": f"Invalid input — expected JSON with user_email, doctor_id, slot_id, priority. Error: {e}"}
+
     if priority not in (0, 1, 2, 3):
         return {"success": False, "error": "Priority must be 0 (urgent), 1, 2, or 3 (routine)"}
 
-    db = get_session()  
+    db = get_session()
     try:
         slot = db.query(DoctorSlot).filter(DoctorSlot.id == slot_id).with_for_update().first()
         if not slot:
@@ -140,12 +177,23 @@ def book_appointment(user_email: str, doctor_id: int, slot_id: int, priority: in
 
 
 @tool
-def save_medical_report(appointment_id: int, summary: str, medication_recommendations: Optional[str] = "None") -> dict:
+def save_medical_report(input_json: str) -> dict:
     """
     Save the AI-generated clinical summary and medication recommendations for an appointment.
     Always call this after booking the appointment.
+    Input must be a JSON string with keys:
+      appointment_id (int), summary (str), medication_recommendations (str, optional).
     The summary should describe the patient's symptoms, triage assessment, and reasoning.
+    Example: {"appointment_id": 5, "summary": "...", "medication_recommendations": "..."}
     """
+    try:
+        params = _parse_json(input_json)
+        appointment_id         = int(params["appointment_id"])
+        summary                = params["summary"]
+        medication_recommendations = params.get("medication_recommendations", "None")
+    except Exception as e:
+        return {"success": False, "error": f"Invalid input — expected JSON with appointment_id, summary. Error: {e}"}
+
     db = get_session()
     try:
         appt = db.query(Appointment).filter(Appointment.id == appointment_id).first()
@@ -168,12 +216,24 @@ def save_medical_report(appointment_id: int, summary: str, medication_recommenda
 
 
 @tool
-def send_confirmation_email(to_email: str, doctor_name: str, slot_datetime: str, department: str) -> dict:
+def send_confirmation_email(input_json: str) -> dict:
     """
     Send an appointment confirmation email to the patient.
     Call this as the last step after saving the medical report.
-    If SMTP is not configured, the confirmation will be logged instead.
+    Input must be a JSON string with keys:
+      to_email (str), doctor_name (str), slot_datetime (str), department (str).
+    If SMTP is not configured, the confirmation will be logged to the console instead.
+    Example: {"to_email": "alice@example.com", "doctor_name": "Dr. Smith", "slot_datetime": "2026-04-25 09:00", "department": "Cardiology"}
     """
+    try:
+        params        = _parse_json(input_json)
+        to_email      = params["to_email"]
+        doctor_name   = params["doctor_name"]
+        slot_datetime = params["slot_datetime"]
+        department    = params["department"]
+    except Exception as e:
+        return {"success": False, "error": f"Invalid input — expected JSON with to_email, doctor_name, slot_datetime, department. Error: {e}"}
+
     subject = "Your Appointment Confirmation — Hospital Workflow Assistant"
     body = (
         f"Dear Patient,\n\n"
@@ -205,3 +265,116 @@ def send_confirmation_email(to_email: str, doctor_name: str, slot_datetime: str,
     else:
         print(f"\n[EMAIL LOG] To: {to_email}\nSubject: {subject}\n{body}\n")
         return {"success": True, "data": {"sent_to": to_email, "method": "logged"}}
+
+
+@tool
+def get_doctor_slots(doctor_id: str) -> dict:
+    """
+    Return all time slots for a given doctor — both available and booked.
+    Useful for inspecting a doctor's full schedule.
+    Input: doctor_id as a string (e.g. "1")
+    """
+    try:
+        did = int(_parse_str(doctor_id, "doctor_id"))
+    except (ValueError, TypeError):
+        return {"success": False, "error": f"Invalid doctor_id: {doctor_id}"}
+
+    db = get_session()
+    try:
+        doctor = db.query(Doctor).filter(Doctor.id == did).first()
+        if not doctor:
+            return {"success": False, "error": f"No doctor found with id {did}"}
+
+        slots = (
+            db.query(DoctorSlot)
+            .filter(DoctorSlot.doctor_id == did)
+            .order_by(DoctorSlot.slot_datetime)
+            .all()
+        )
+        return {
+            "success": True,
+            "data": {
+                "doctor_id": doctor.id,
+                "doctor_name": doctor.name,
+                "specialty": doctor.specialty,
+                "slots": [
+                    {
+                        "slot_id": s.id,
+                        "datetime": s.slot_datetime.strftime("%Y-%m-%d %H:%M"),
+                        "status": "booked" if s.is_booked else "available",
+                    }
+                    for s in slots
+                ],
+            },
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+    finally:
+        db.close()
+
+
+@tool
+def get_all_appointments(_: str = "") -> dict:
+    """
+    Return all appointments in the system with patient, doctor, slot, and priority details.
+    Use this to inspect the current state of bookings.
+    No input required — pass an empty string.
+    """
+    db = get_session()
+    try:
+        appointments = db.query(Appointment).order_by(Appointment.id).all()
+        return {
+            "success": True,
+            "data": [
+                {
+                    "appointment_id": a.id,
+                    "patient_email": a.user_email,
+                    "doctor": a.doctor.name,
+                    "specialty": a.doctor.specialty,
+                    "slot_datetime": a.slot.slot_datetime.strftime("%Y-%m-%d %H:%M"),
+                    "priority": a.priority,
+                    "has_report": a.medical_report is not None,
+                }
+                for a in appointments
+            ],
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+    finally:
+        db.close()
+
+
+@tool
+def get_medical_report(appointment_id: str) -> dict:
+    """
+    Retrieve the medical report for a given appointment, if it exists.
+    Input: appointment_id as a string (e.g. "5")
+    """
+    try:
+        aid = int(_parse_str(appointment_id, "appointment_id"))
+    except (ValueError, TypeError):
+        return {"success": False, "error": f"Invalid appointment_id: {appointment_id}"}
+
+    db = get_session()
+    try:
+        report = (
+            db.query(MedicalReport)
+            .filter(MedicalReport.appointment_id == aid)
+            .first()
+        )
+        if not report:
+            return {"success": False, "error": f"No medical report found for appointment {aid}"}
+
+        return {
+            "success": True,
+            "data": {
+                "report_id": report.id,
+                "appointment_id": report.appointment_id,
+                "summary": report.summary,
+                "medication_recommendations": report.medication_recommendations,
+            },
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+    finally:
+        db.close()

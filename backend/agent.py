@@ -1,7 +1,7 @@
 import os
 from langchain_anthropic import ChatAnthropic
-from langchain.agents import AgentExecutor, create_react_agent
-from langchain.memory import ConversationBufferMemory
+from langchain_classic.agents import AgentExecutor, create_react_agent
+from langchain_classic.memory import ConversationBufferMemory
 from langchain_core.prompts import PromptTemplate
 from dotenv import load_dotenv
 
@@ -55,12 +55,12 @@ IMPORTANT RULES:
 
 Available specialties: cardiology, neurology, general, orthopedics, dermatology, gastroenterology, pulmonology, endocrinology
 
-TOOL INPUT REFERENCE — use these exact argument names and types:
-- get_patient_history(email: str)
-- find_available_doctor(specialty: str)
-- book_appointment(user_email: str, doctor_id: int, slot_id: int, priority: int)
-- save_medical_report(appointment_id: int, summary: str, medication_recommendations: str)
-- send_confirmation_email(to_email: str, doctor_name: str, slot_datetime: str, department: str)
+TOOL INPUT REFERENCE — exact format required:
+- get_patient_history     → plain string:  alice@example.com
+- find_available_doctor   → plain string:  cardiology
+- book_appointment        → JSON string:   {{"user_email": "...", "doctor_id": 1, "slot_id": 3, "priority": 0}}
+- save_medical_report     → JSON string:   {{"appointment_id": 5, "summary": "...", "medication_recommendations": "..."}}
+- send_confirmation_email → JSON string:   {{"to_email": "...", "doctor_name": "...", "slot_datetime": "...", "department": "..."}}
 
 {tools}
 
