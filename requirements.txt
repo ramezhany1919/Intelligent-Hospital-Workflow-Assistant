@@ -1,0 +1,10 @@
+anthropic
+langchain
+langchain-anthropic
+langchain-community
+fastapi
+uvicorn
+sqlalchemy
+psycopg2-binary
+python-dotenv
+pydantic
