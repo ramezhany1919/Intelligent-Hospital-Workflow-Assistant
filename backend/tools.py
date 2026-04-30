@@ -1,6 +1,7 @@
 import smtplib
 import os
 import json
+import pandas as pd
 from email.mime.text import MIMEText
 from langchain_core.tools import tool
 from backend.database import get_session
@@ -234,7 +235,7 @@ def send_confirmation_email(input_json: str) -> dict:
     except Exception as e:
         return {"success": False, "error": f"Invalid input — expected JSON with to_email, doctor_name, slot_datetime, department. Error: {e}"}
 
-    subject = "Your Appointment Confirmation — Hospital Workflow Assistant"
+    subject = "Your Appointment Confirmation — Medica"
     body = (
         f"Dear Patient,\n\n"
         f"Your appointment has been successfully booked.\n\n"
@@ -243,7 +244,7 @@ def send_confirmation_email(input_json: str) -> dict:
         f"  Date/Time : {slot_datetime}\n\n"
         f"Please note: This booking was assisted by an AI system. "
         f"All recommendations are preliminary and subject to physician review.\n\n"
-        f"See you soon,\nHospital Workflow Assistant"
+        f"See you soon,\nMedica"
     )
 
     smtp_host = os.getenv("SMTP_HOST")
@@ -378,3 +379,44 @@ def get_medical_report(appointment_id: str) -> dict:
         return {"success": False, "error": str(e)}
     finally:
         db.close()
+
+
+# ── Notebook utility (not an agent tool) ──────────────────────────────────────
+
+def show_appointments(email_filter: str = "") -> pd.DataFrame:
+    """
+    Return a formatted DataFrame of all appointments in the DB.
+    Optionally filter by patient email (partial match, case-insensitive).
+
+    Usage in notebook:
+        from backend.tools import show_appointments
+        show_appointments()                        # all appointments
+        show_appointments("alice@example.com")     # specific patient
+        show_appointments("example.com")           # partial match
+    """
+    PRIORITY_LABELS = {0: "P0 — Urgent", 1: "P1 — High", 2: "P2 — Moderate", 3: "P3 — Routine"}
+    db = get_session()
+    try:
+        q = db.query(Appointment)
+        if email_filter.strip():
+            q = q.filter(Appointment.user_email.ilike(f"%{email_filter.strip()}%"))
+        rows = []
+        for a in q.order_by(Appointment.id).all():
+            rows.append({
+                "ID":          a.id,
+                "Patient":     a.user_email,
+                "Doctor":      a.doctor.name,
+                "Specialty":   a.doctor.specialty.title(),
+                "Date & Time": a.slot.slot_datetime.strftime("%Y-%m-%d %H:%M"),
+                "Priority":    PRIORITY_LABELS.get(a.priority, str(a.priority)),
+                "Report":      "Yes" if a.medical_report else "No",
+            })
+    finally:
+        db.close()
+
+    if not rows:
+        msg = "No appointments found" + (f" for '{email_filter}'" if email_filter else "") + "."
+        print(msg)
+        return pd.DataFrame()
+
+    return pd.DataFrame(rows).set_index("ID")
